@@ -844,7 +844,11 @@ where
                 if IrqMask::RxTxTimeout.is_set(irq_flags) {
                     return Err(RadioError::ReceiveTimeout);
                 }
-                if IrqMask::PreambleDetected.is_set(irq_flags) || IrqMask::HeaderValid.is_set(irq_flags) {
+                // Both can be set by the time the flags are read: report the later one
+                if IrqMask::HeaderValid.is_set(irq_flags) {
+                    return Ok(Some(IrqState::HeaderValid));
+                }
+                if IrqMask::PreambleDetected.is_set(irq_flags) {
                     return Ok(Some(IrqState::PreambleReceived));
                 }
             }

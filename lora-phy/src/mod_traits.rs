@@ -25,6 +25,12 @@ pub trait InterfaceVariant {
 pub enum IrqState {
     /// Runs the loop until after the preamble has been received
     PreambleReceived,
+    /// A valid header was received after the preamble, so a packet really is
+    /// arriving. A preamble alone doesn't promise that: e.g. a receiver that
+    /// starts listening mid-packet can detect a preamble in the payload and
+    /// then get no further IRQ. Only reported by chips that can tell the two
+    /// apart (SX126x); others report `PreambleReceived` for both.
+    HeaderValid,
     /// Runs the loop until the operation is fully complete
     Done,
 }

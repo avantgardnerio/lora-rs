@@ -29,6 +29,9 @@ const SX126X_MAX_LORA_SYMB_NUM_TIMEOUT: u8 = 248;
 // Time required for the TCXO to wakeup [ms].
 const BRD_TCXO_WAKEUP_TIME: u32 = 10;
 
+// SetRxTxFallbackMode argument: STDBY_XOSC (the default is STDBY_RC, 0x20)
+const FALLBACK_STDBY_XOSC: u8 = 0x30;
+
 // SetRx timeout argument for enabling continuous mode
 const RX_CONTINUOUS_TIMEOUT: u32 = 0xffffff;
 
@@ -64,6 +67,8 @@ pub struct Sx126x<SPI, IV, C: Sx126xVariant + Sized> {
     config: Config<C>,
     /// IRQ flags the last `get_irq_state` read, for `clear_irq_flags_read`
     irq_flags_read: u16,
+    /// Standby (and TX/RX fallback) mode: RC unless `with_oscillator_kept_on`
+    standby_mode: StandbyMode,
 }
 
 impl<SPI, IV, C> Sx126x<SPI, IV, C>
@@ -79,7 +84,19 @@ where
             intf,
             config,
             irq_flags_read: 0,
+            standby_mode: StandbyMode::RC,
         }
+    }
+
+    /// Keep the oscillator (TCXO or crystal) running between operations:
+    /// standby in STDBY_XOSC instead of STDBY_RC, and fall back to STDBY_XOSC
+    /// after a TX or RX. STDBY_RC stops the oscillator, so every TX and RX
+    /// first waits for it to start again: with a TCXO that's the full
+    /// wake-up timeout set in `init_lora`, before each TX and again before
+    /// listening after it. Costs the oscillator's current while idle.
+    pub fn with_oscillator_kept_on(mut self) -> Self {
+        self.standby_mode = StandbyMode::XOSC;
+        self
     }
 
     // Utility functions
@@ -276,6 +293,12 @@ where
         self.intf.write_with_payload(&lora_syncword_set, &word, false).await?;
 
         self.set_tx_rx_buffer_base_address(0, 0).await?;
+        // Leave the oscillator running after a TX or RX, if asked to
+        if self.standby_mode == StandbyMode::XOSC {
+            self.intf
+                .write(&[OpCode::SetTxFallbackMode.value(), FALLBACK_STDBY_XOSC], false)
+                .await?;
+        }
         // Update register list to support warm starts from sleep mode
         self.update_retention_list().await?;
         Ok(())
@@ -353,9 +376,9 @@ where
         Ok(())
     }
 
-    // Use standby mode RC (not XOSC).
+    // Standby RC unless `with_oscillator_kept_on` asked for XOSC
     async fn set_standby(&mut self) -> Result<(), RadioError> {
-        let op_code_and_standby_mode = [OpCode::SetStandby.value(), StandbyMode::RC.value()];
+        let op_code_and_standby_mode = [OpCode::SetStandby.value(), self.standby_mode.value()];
         self.intf.write(&op_code_and_standby_mode, false).await?;
         self.intf.iv.disable_rf_switch().await
     }

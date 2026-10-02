@@ -129,4 +129,10 @@ pub trait RadioKind {
     ) -> Result<Option<IrqState>, RadioError>;
     /// Clear IRQ status
     async fn clear_irq_status(&mut self) -> Result<(), RadioError>;
+    /// Clear only the IRQ flags the last `get_irq_state` read, so one raised
+    /// since then (e.g. RxDone right after a header) stays set to be handled.
+    /// Chips that don't track this clear everything, like `clear_irq_status`.
+    async fn clear_irq_flags_read(&mut self) -> Result<(), RadioError> {
+        self.clear_irq_status().await
+    }
 }

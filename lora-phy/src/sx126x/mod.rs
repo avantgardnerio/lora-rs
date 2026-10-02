@@ -62,6 +62,8 @@ pub struct Config<C: Sx126xVariant + Sized> {
 pub struct Sx126x<SPI, IV, C: Sx126xVariant + Sized> {
     intf: SpiInterface<SPI, IV>,
     config: Config<C>,
+    /// IRQ flags the last `get_irq_state` read, for `clear_irq_flags_read`
+    irq_flags_read: u16,
 }
 
 impl<SPI, IV, C> Sx126x<SPI, IV, C>
@@ -73,7 +75,11 @@ where
     /// Create an instance of the RadioKind implementation for the LoRa chip kind and board type
     pub fn new(spi: SPI, iv: IV, config: Config<C>) -> Self {
         let intf = SpiInterface::new(spi, iv);
-        Self { intf, config }
+        Self {
+            intf,
+            config,
+            irq_flags_read: 0,
+        }
     }
 
     // Utility functions
@@ -798,6 +804,7 @@ where
         // Assuming intf.read_with_status is an existing async method that reads the IRQ status.
         let read_status = self.intf.read_with_status(&op_code, &mut irq_status).await?;
         let irq_flags = ((irq_status[0] as u16) << 8) | (irq_status[1] as u16);
+        self.irq_flags_read = irq_flags;
 
         if OpStatusErrorMask::is_error(read_status) {
             debug!(
@@ -872,6 +879,12 @@ where
 
     async fn clear_irq_status(&mut self) -> Result<(), RadioError> {
         let op_code_and_irq_status = [OpCode::ClrIrqStatus.value(), 0xffu8, 0xffu8]; // clear all interrupts
+        self.intf.write(&op_code_and_irq_status, false).await
+    }
+
+    async fn clear_irq_flags_read(&mut self) -> Result<(), RadioError> {
+        let flags = core::mem::take(&mut self.irq_flags_read);
+        let op_code_and_irq_status = [OpCode::ClrIrqStatus.value(), (flags >> 8) as u8, flags as u8];
         self.intf.write(&op_code_and_irq_status, false).await
     }
 

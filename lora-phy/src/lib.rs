@@ -333,6 +333,13 @@ where
         self.radio_kind.clear_irq_status().await
     }
 
+    /// Clears only the IRQ flags the last [`LoRa::get_irq_state`] read. Unlike
+    /// [`LoRa::clear_irq_status`], a flag raised in between (e.g. RxDone right
+    /// after a header) stays set, so its IRQ isn't lost.
+    pub async fn clear_irq_flags_read(&mut self) -> Result<(), RadioError> {
+        self.radio_kind.clear_irq_flags_read().await
+    }
+
     /// Extracts the received payload and packet status after a completed RX IRQ event.
     /// Should be called after receiving `IrqState::Done`.
     pub async fn get_rx_result(

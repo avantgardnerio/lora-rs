@@ -61,6 +61,97 @@ pub struct Config<C: Sx126xVariant + Sized> {
     pub rx_boost: bool,
 }
 
+/// Longest setting command we cache: CfgDIOIrq, opcode + 8 bytes
+const MAX_SETTING_BYTES: usize = 9;
+
+/// Settings last written to the chip, so writing one again unchanged can be
+/// skipped (see `with_unchanged_settings_skipped`). The chip keeps them
+/// through standby, TX and RX; a reset, sleep or re-init forgets them here.
+#[derive(Default)]
+struct SettingCache {
+    enabled: bool,
+    /// Setting commands as written: opcode, then arguments
+    commands: [Option<([u8; MAX_SETTING_BYTES], usize)>; 8],
+    /// Configuration registers: address, value
+    registers: [Option<(u16, u8)>; 5],
+}
+
+impl SettingCache {
+    /// Was exactly this setting command the last one of its kind written?
+    fn has_command(&self, op_and_args: &[u8]) -> bool {
+        self.enabled
+            && self
+                .commands
+                .iter()
+                .flatten()
+                .any(|(bytes, len)| &bytes[..*len] == op_and_args)
+    }
+
+    fn note_command(&mut self, op_and_args: &[u8]) {
+        if !self.enabled || op_and_args.len() > MAX_SETTING_BYTES {
+            return;
+        }
+        let mut bytes = [0u8; MAX_SETTING_BYTES];
+        bytes[..op_and_args.len()].copy_from_slice(op_and_args);
+        let entry = Some((bytes, op_and_args.len()));
+        // Replace this opcode's entry, or take a free one
+        let opcode = op_and_args[0];
+        if let Some(slot) = self
+            .commands
+            .iter_mut()
+            .find(|slot| matches!(slot, Some((b, _)) if b[0] == opcode))
+        {
+            *slot = entry;
+        } else if let Some(slot) = self.commands.iter_mut().find(|slot| slot.is_none()) {
+            *slot = entry;
+        }
+    }
+
+    /// The value last written to (or read from) a configuration register
+    fn register(&self, reg: Register) -> Option<u8> {
+        if !self.enabled {
+            return None;
+        }
+        let addr = reg as u16;
+        self.registers
+            .iter()
+            .flatten()
+            .find(|(a, _)| *a == addr)
+            .map(|(_, value)| *value)
+    }
+
+    fn note_register(&mut self, reg: Register, value: u8) {
+        // Only configuration registers: nothing but our writes changes them
+        let config = matches!(
+            reg,
+            Register::TxModulation
+                | Register::IQPolarity
+                | Register::RxGain
+                | Register::SynchTimeout
+                | Register::TxClampCfg
+        );
+        if !self.enabled || !config {
+            return;
+        }
+        let addr = reg as u16;
+        if let Some(slot) = self
+            .registers
+            .iter_mut()
+            .find(|slot| matches!(slot, Some((a, _)) if *a == addr))
+        {
+            *slot = Some((addr, value));
+        } else if let Some(slot) = self.registers.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some((addr, value));
+        }
+    }
+
+    /// The chip may have lost its settings: write everything next time
+    fn forget(&mut self) {
+        self.commands = Default::default();
+        self.registers = Default::default();
+    }
+}
+
 /// Base for the RadioKind implementation for the LoRa chip kind and board type
 pub struct Sx126x<SPI, IV, C: Sx126xVariant + Sized> {
     intf: SpiInterface<SPI, IV>,
@@ -69,6 +160,7 @@ pub struct Sx126x<SPI, IV, C: Sx126xVariant + Sized> {
     irq_flags_read: u16,
     /// Standby (and TX/RX fallback) mode: RC unless `with_oscillator_kept_on`
     standby_mode: StandbyMode,
+    settings: SettingCache,
 }
 
 impl<SPI, IV, C> Sx126x<SPI, IV, C>
@@ -85,6 +177,7 @@ where
             config,
             irq_flags_read: 0,
             standby_mode: StandbyMode::RC,
+            settings: SettingCache::default(),
         }
     }
 
@@ -97,6 +190,26 @@ where
     pub fn with_oscillator_kept_on(mut self) -> Self {
         self.standby_mode = StandbyMode::XOSC;
         self
+    }
+
+    /// Skip writing a setting the chip already has. Every TX and RX prepare
+    /// rewrites the modulation, packet and channel settings, PA and RX gain
+    /// configuration and so on, mostly unchanged: each is an SPI transaction
+    /// plus a BUSY wait. With this, only what changed is sent. The settings
+    /// written are remembered, and forgotten on reset, sleep and re-init.
+    pub fn with_unchanged_settings_skipped(mut self) -> Self {
+        self.settings.enabled = true;
+        self
+    }
+
+    /// Write a setting command, unless the chip already has exactly this one
+    async fn write_setting(&mut self, op_and_args: &[u8]) -> Result<(), RadioError> {
+        if self.settings.has_command(op_and_args) {
+            return Ok(());
+        }
+        self.intf.write(op_and_args, false).await?;
+        self.settings.note_command(op_and_args);
+        Ok(())
     }
 
     // Utility functions
@@ -155,9 +268,7 @@ where
             exp += 1;
         }
         let val: u8 = mant << ((2 * exp) + 1);
-        self.intf
-            .write(&[OpCode::SetLoRaSymbTimeout.value(), val], false)
-            .await?;
+        self.write_setting(&[OpCode::SetLoRaSymbTimeout.value(), val]).await?;
 
         if symbol_num > 0 {
             let timeout = exp + (mant << 3);
@@ -175,7 +286,7 @@ where
             device_sel as u8,
             PA_LUT_RESERVED,
         ];
-        self.intf.write(&op_code_and_pa_config, false).await
+        self.write_setting(&op_code_and_pa_config).await
     }
 
     fn timeout_1(timeout: u32) -> u8 {
@@ -199,16 +310,25 @@ where
 
     // SX162x WriteRegister wrapper for single u8 value writes
     async fn reg_w_8(&mut self, reg: Register, value: u8) -> Result<(), RadioError> {
+        if self.settings.register(reg) == Some(value) {
+            return Ok(());
+        }
         self.intf
             .write(&[OpCode::WriteRegister.value(), reg.addr1(), reg.addr2(), value], false)
-            .await
+            .await?;
+        self.settings.note_register(reg, value);
+        Ok(())
     }
     // SX162x ReadRegister wrapper for single u8 value reads
     async fn reg_r_8(&mut self, reg: Register) -> Result<u8, RadioError> {
+        if let Some(value) = self.settings.register(reg) {
+            return Ok(value);
+        }
         let mut buf = [0u8];
         self.intf
             .read(&[OpCode::ReadRegister.value(), reg.addr1(), reg.addr2(), 0], &mut buf)
             .await?;
+        self.settings.note_register(reg, buf[0]);
         Ok(buf[0])
     }
 
@@ -236,6 +356,7 @@ where
     C: Sx126xVariant,
 {
     async fn init_lora(&mut self, sync_word: u8) -> Result<(), RadioError> {
+        self.settings.forget();
         // DC-DC regulator setup (default is LDO)
         if self.config.use_dcdc {
             let reg_data = [OpCode::SetRegulatorMode.value(), RegulatorMode::UseDCDC.value()];
@@ -361,6 +482,7 @@ where
     }
 
     async fn reset(&mut self, delay: &mut impl DelayNs) -> Result<(), RadioError> {
+        self.settings.forget();
         self.intf.iv.reset(delay).await
     }
 
@@ -384,6 +506,7 @@ where
     }
 
     async fn set_sleep(&mut self, warm_start_if_possible: bool, delay: &mut impl DelayNs) -> Result<(), RadioError> {
+        self.settings.forget();
         self.intf.iv.disable_rf_switch().await?;
         let sleep_params = SleepParams {
             wakeup_rtc: false,
@@ -507,7 +630,7 @@ where
             }
         }
         let op_code_and_tx_params = [OpCode::SetTxParams.value(), tx_params_power, ramp_time.value()];
-        self.intf.write(&op_code_and_tx_params, false).await
+        self.write_setting(&op_code_and_tx_params).await
     }
 
     async fn set_modulation_params(&mut self, mdltn_params: &ModulationParams) -> Result<(), RadioError> {
@@ -525,7 +648,7 @@ where
             coding_rate_val,
             mdltn_params.low_data_rate_optimize,
         ];
-        self.intf.write(&op_code_and_mod_params, false).await?;
+        self.write_setting(&op_code_and_mod_params).await?;
 
         // From 15.1 DS.SX1261-2.W.APP, Rev2.2 Dec 2024
         // Modulation Quality with 500kHz LoRa Bandwidth
@@ -551,7 +674,7 @@ where
             pkt_params.crc_on as u8,
             pkt_params.iq_inverted as u8,
         ];
-        self.intf.write(&op_code_and_pkt_params, false).await?;
+        self.write_setting(&op_code_and_pkt_params).await?;
 
         // From 15.4 DS.SX1261-2.W.APP, Rev2.2 Dec 2024
         // Optimizing the Inverted IQ Operation
@@ -601,7 +724,7 @@ where
             ((freq_in_pll_steps >> 8) & 0xFF) as u8,
             (freq_in_pll_steps & 0xFF) as u8,
         ];
-        self.intf.write(&op_code_and_pll_steps, false).await
+        self.write_setting(&op_code_and_pll_steps).await
     }
 
     async fn set_payload(&mut self, payload: &[u8]) -> Result<(), RadioError> {
@@ -627,7 +750,7 @@ where
 
         // Stop the Rx timer on preamble detection
         let op_code_and_true_flag = [OpCode::SetStopRxTimerOnPreamble.value(), 0x01u8];
-        self.intf.write(&op_code_and_true_flag, false).await?;
+        self.write_setting(&op_code_and_true_flag).await?;
 
         let num_symbols = match rx_mode {
             RxMode::DutyCycle(_) | RxMode::Continuous => 0,
@@ -803,7 +926,7 @@ where
             ((dio3_mask >> 8) & 0x00FF) as u8,
             (dio3_mask & 0x00FF) as u8,
         ];
-        self.intf.write(&op_code_and_masks, false).await
+        self.write_setting(&op_code_and_masks).await
     }
 
     async fn set_tx_continuous_wave_mode(&mut self) -> Result<(), RadioError> {

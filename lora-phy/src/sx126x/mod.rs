@@ -2,8 +2,8 @@ mod radio_kind_params;
 
 use embedded_hal_async::delay::DelayNs;
 use embedded_hal_async::spi::*;
-pub use radio_kind_params::TcxoCtrlVoltage;
 use radio_kind_params::*;
+pub use radio_kind_params::{CADSymbols, TcxoCtrlVoltage};
 
 use crate::mod_params::*;
 use crate::mod_traits::IrqState;
@@ -161,6 +161,8 @@ pub struct Sx126x<SPI, IV, C: Sx126xVariant + Sized> {
     /// Standby (and TX/RX fallback) mode: RC unless `with_oscillator_kept_on`
     standby_mode: StandbyMode,
     settings: SettingCache,
+    /// CAD symbols, detection peak and minimum: None = the defaults in do_cad
+    cad_params: Option<(CADSymbols, u8, u8)>,
 }
 
 impl<SPI, IV, C> Sx126x<SPI, IV, C>
@@ -178,6 +180,7 @@ where
             irq_flags_read: 0,
             standby_mode: StandbyMode::RC,
             settings: SettingCache::default(),
+            cad_params: None,
         }
     }
 
@@ -200,6 +203,12 @@ where
     pub fn with_unchanged_settings_skipped(mut self) -> Self {
         self.settings.enabled = true;
         self
+    }
+
+    /// Override CAD's number of symbols, detection peak (cadDetPeak) and
+    /// minimum (cadDetMin). See Semtech AN1200.48 for what they trade
+    pub fn set_cad_params(&mut self, symbols: CADSymbols, det_peak: u8, det_min: u8) {
+        self.cad_params = Some((symbols, det_peak, det_min));
     }
 
     /// Write a setting command, unless the chip already has exactly this one
@@ -872,13 +881,16 @@ where
         //  https://lora-developers.semtech.com/documentation/tech-papers-and-guides/channel-activity-detection-ensuring-your-lora-packets-are-sent/how-to-ensure-your-lora-packets-are-sent-properly
         // for default values used here.
         let spreading_factor_val = spreading_factor_value(mdltn_params.spreading_factor)?;
+        let (symbols, det_peak, det_min) =
+            self.cad_params
+                .unwrap_or((CADSymbols::_8, spreading_factor_val + 13u8, 10u8));
         let op_code_and_cad_params = [
             OpCode::SetCADParams.value(),
-            CADSymbols::_8.value(),      // number of symbols for detection
-            spreading_factor_val + 13u8, // limit for detection of SNR peak
-            10u8,                        // minimum symbol recognition
-            0x00u8,                      // CAD exit mode without listen-before-send or subsequent receive processing
-            0x00u8,                      // no timeout
+            symbols.value(), // number of symbols for detection
+            det_peak,        // limit for detection of SNR peak
+            det_min,         // minimum symbol recognition
+            0x00u8,          // CAD exit mode without listen-before-send or subsequent receive processing
+            0x00u8,          // no timeout
             0x00u8,
             0x00u8,
         ];

@@ -298,16 +298,23 @@ pub fn coding_rate_value(coding_rate: CodingRate) -> Result<u8, RadioError> {
     }
 }
 
+/// How many symbols a CAD listens for (SetCADParams cadSymbolNum)
 #[derive(Clone, Copy)]
 pub enum CADSymbols {
+    /// 1 symbol
     _1 = 0x00,
+    /// 2 symbols: Semtech's suggestion for SF7 and SF8
     _2 = 0x01,
+    /// 4 symbols
     _4 = 0x02,
+    /// 8 symbols: lora-phy's default
     _8 = 0x03,
+    /// 16 symbols
     _16 = 0x04,
 }
 
 impl CADSymbols {
+    /// The value SetCADParams takes
     pub fn value(self) -> u8 {
         self as u8
     }

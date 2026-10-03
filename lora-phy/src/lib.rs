@@ -107,6 +107,11 @@ where
         self.radio_kind.process_irq_event(self.radio_mode, None, false).await
     }
 
+    /// The radio driver, for settings this layer doesn't cover
+    pub fn radio_kind_mut(&mut self) -> &mut RK {
+        &mut self.radio_kind
+    }
+
     /// Create modulation parameters for a communication channel
     pub fn create_modulation_params(
         &mut self,

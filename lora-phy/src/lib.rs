@@ -409,6 +409,19 @@ where
         Ok(())
     }
 
+    /// Move to another frequency for the next `cad`, with one SetRfFrequency
+    /// command: for sweeping channels fast. After a CAD the chip is back in
+    /// standby on its own, and nothing else needs sending again (the full
+    /// `prepare_for_cad` costs ~5 commands). Call `prepare_for_cad` first,
+    /// once, for the modulation.
+    pub async fn retune_for_cad(&mut self, frequency_in_hz: u32) -> Result<(), RadioError> {
+        if self.radio_mode != RadioMode::ChannelActivityDetection {
+            return Err(RadioError::InvalidRadioMode);
+        }
+        self.radio_kind.ensure_ready(self.radio_mode).await?;
+        self.radio_kind.set_channel(frequency_in_hz).await
+    }
+
     /// Start channel activity detection (CAD) operation and return the result
     ///
     /// # Warning

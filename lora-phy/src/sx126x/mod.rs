@@ -163,6 +163,8 @@ pub struct Sx126x<SPI, IV, C: Sx126xVariant + Sized> {
     settings: SettingCache,
     /// CAD symbols, detection peak and minimum: None = the defaults in do_cad
     cad_params: Option<(CADSymbols, u8, u8)>,
+    /// How long the chip waits for the TCXO to start (SetDIO3AsTCXOCtrl)
+    tcxo_wakeup_us: u32,
 }
 
 impl<SPI, IV, C> Sx126x<SPI, IV, C>
@@ -181,6 +183,7 @@ where
             standby_mode: StandbyMode::RC,
             settings: SettingCache::default(),
             cad_params: None,
+            tcxo_wakeup_us: BRD_TCXO_WAKEUP_TIME * 1000,
         }
     }
 
@@ -203,6 +206,14 @@ where
     pub fn with_unchanged_settings_skipped(mut self) -> Self {
         self.settings.enabled = true;
         self
+    }
+
+    /// How long the chip waits for the TCXO to start, from the next `init`
+    /// (default 10ms). A CAD always ends in STDBY_RC, which stops the TCXO,
+    /// so every CAD pays this. Too short for the TCXO and the radio runs
+    /// before its clock has settled
+    pub fn set_tcxo_wakeup_us(&mut self, us: u32) {
+        self.tcxo_wakeup_us = us;
     }
 
     /// Override CAD's number of symbols, detection peak (cadDetPeak) and
@@ -393,7 +404,7 @@ where
                 .await?;
 
             // Each unit is 15.625uS (which is 1/64th ms)
-            let timeout = BRD_TCXO_WAKEUP_TIME << 6;
+            let timeout = self.tcxo_wakeup_us * 64 / 1000;
             let op_code_and_tcxo_control = [
                 OpCode::SetTCXOMode.value(),
                 voltage.value() & 0x07,
@@ -894,7 +905,7 @@ where
             0x00u8,
             0x00u8,
         ];
-        self.intf.write(&op_code_and_cad_params, false).await?;
+        self.write_setting(&op_code_and_cad_params).await?;
 
         let op_code_for_set_cad = [OpCode::SetCAD.value()];
         self.intf.write(&op_code_for_set_cad, false).await
